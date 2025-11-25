@@ -4,6 +4,6 @@
      Creating library C:\working_tools\DirectXTex\x64\Release\DirectXTexTest.lib and object C:\working_tools\DirectXTex\x64\Release\DirectXTexTest.exp
   Generating code
   Previous IPDB not found, fall back to full compilation.
-  All 34 functions were compiled because no usable IPDB/IOBJ from previous compilation was found.
+  All 124 functions were compiled because no usable IPDB/IOBJ from previous compilation was found.
   Finished generating code
   DirectXTexDLL.vcxproj -> C:\working_tools\DirectXTex\x64\Release\DirectXTexTest.dll
