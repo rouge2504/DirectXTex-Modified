@@ -9,6 +9,27 @@
 
 using namespace DirectX;
 
+enum RuleId
+{
+    RULE_SMALL_ALPHA_ICON = 1,
+    RULE_GLOWFX_UNCOMPRESSED = 2,
+    RULE_DARK_GRADIENT_UNCOMPRESSED = 3,
+    RULE_ANIMATION_BC7 = 4,
+    RULE_JACKPOT_UNCOMPRESSED = 5,
+    RULE_PROGRESSCOUNTERS_UNCOMP = 6,
+    RULE_BIG_750_BC7 = 7,
+    RULE_SMALL_SOLID_SYMBOL_BC3 = 8,
+    RULE_LONG_STRIP_BC7 = 9,
+    RULE_LONG_STRIP_SHEET_UNCOMP = 10,
+    RULE_LONG_STRIP_SHEET_BC3 = 11,
+    RULE_FONTS_BC7 = 12,
+    RULE_FALLBACK_BC3 = 13,
+    RULE_FALLBACK_BC7_BALANCED = 14,
+    RULE_DEFAULT_BC7_HIGH_QUALITY = 15,
+    RULE_BIG_IMAGE_BC3 = 16
+
+};
+
 
 enum class BC7Quality
 {
@@ -65,7 +86,9 @@ HRESULT CompressBC7(const ScratchImage& rgba, ScratchImage& out, BC7Quality qual
             break;
 
         case BC7Quality::HighQuality:
-            flags |= TEX_COMPRESS_BC7_USE_3SUBSETS;
+            flags |= TEX_COMPRESS_BC7_USE_3SUBSETS |
+                TEX_COMPRESS_BC7_QUICK |
+                TEX_COMPRESS_PARALLEL;
             break;
 
         case BC7Quality::HighQualityUniform:
@@ -155,6 +178,20 @@ float ComputeColorStdDev(const DirectX::Image* img)
     var /= count;
     return (float)std::sqrt(var);
 }
+
+static void LogRule(const char* ruleName, size_t w, size_t h, bool hasAlpha, const char* extra = "")
+{
+    char buffer[512];
+    sprintf_s(buffer,
+        ">>> RULE HIT: %s | size=%zux%zu | alpha=%s %s\n",
+        ruleName,
+        w, h,
+        hasAlpha ? "YES" : "NO",
+        extra
+    );
+    OutputDebugStringA(buffer);
+}
+
 
 // Detección de alpha suave
 bool DetectSoftAlpha(const DirectX::Image* img)
@@ -815,6 +852,40 @@ HRESULT ConvertToRGBAFast(const ScratchImage& src, ScratchImage& out)
         out
     );
 }
+bool HasFineGradient(const ScratchImage& img)
+{
+    auto meta = img.GetMetadata();
+    const Image* base = img.GetImage(0, 0, 0);
+
+    int w = (int)meta.width;
+    int h = (int)meta.height;
+
+    const uint8_t* p = base->pixels;
+    int pitch = (int)base->rowPitch;
+
+    int gradientCount = 0;
+    int samples = 0;
+
+    for (int y = 1; y < h; y += h / 20)
+    {
+        for (int x = 1; x < w; x += w / 20)
+        {
+            const uint8_t* a = p + 4 * (y * w + x);
+            const uint8_t* b = p + 4 * ((y - 1) * w + x);
+
+            int dr = abs(a[0] - b[0]);
+            int dg = abs(a[1] - b[1]);
+            int db = abs(a[2] - b[2]);
+
+            if (dr + dg + db > 40)
+                gradientCount++;
+
+            samples++;
+        }
+    }
+
+    return (gradientCount > samples * 0.30f);
+}
 
 
 
@@ -858,52 +929,56 @@ int __stdcall ConvertPNGtoDDSW(const wchar_t* src, const wchar_t* dst)
     if (w < 450 && h < 450 && hasAlpha)
     {
         ScratchImage rgba;
-
-        hr = ConvertToRGBA(img, rgba);
-
+        hr = ConvertToRGBAFast(img, rgba);
         if (FAILED(hr)) return hr;
 
-        return SaveToDDSFile(
+        hr = SaveToDDSFile(
             rgba.GetImages(),
             rgba.GetImageCount(),
             rgba.GetMetadata(),
             DDS_FLAGS_NONE,
             dst);
+
+        if (FAILED(hr)) return hr;
+        return RULE_SMALL_ALPHA_ICON;
     }
+
 
     if (IsGlowFX(base))
     {
         ScratchImage rgba;
-
         hr = ConvertToRGBAFast(img, rgba);
-        hr = ConvertToRGBAFast(img, rgba);
-
         if (FAILED(hr)) return hr;
 
-        // DDS sin compresión, mismo formato que el PNG
-        return SaveToDDSFile(
+        hr = SaveToDDSFile(
             rgba.GetImages(),
             rgba.GetImageCount(),
             rgba.GetMetadata(),
             DDS_FLAGS_NONE,
             dst);
+
+        if (FAILED(hr)) return hr;
+        return RULE_GLOWFX_UNCOMPRESSED;
     }
+
 
     if (IsDarkGradientBackground(base))
     {
         ScratchImage rgba;
-
         hr = ConvertToRGBAFast(img, rgba);
-
         if (FAILED(hr)) return hr;
 
-        return SaveToDDSFile(
+        hr = SaveToDDSFile(
             rgba.GetImages(),
             rgba.GetImageCount(),
             rgba.GetMetadata(),
             DDS_FLAGS_NONE,
             dst);
+
+        if (FAILED(hr)) return hr;
+        return RULE_DARK_GRADIENT_UNCOMPRESSED;
     }
+
 
     std::wstring srcPath(src);
 
@@ -920,75 +995,89 @@ int __stdcall ConvertPNGtoDDSW(const wchar_t* src, const wchar_t* dst)
 
     if (lower.find(L"animation") != std::wstring::npos)
     {
-
-        ScratchImage rgba;  hr = ConvertToRGBAFast(img, rgba);
+        ScratchImage rgba;
+        hr = ConvertToRGBAFast(img, rgba);
         if (FAILED(hr)) return hr;
 
-        ScratchImage bc7;   hr = CompressBC7(rgba, bc7, BC7Quality::QuickOnly);
+        ScratchImage bc7;
+        hr = CompressBC7(rgba, bc7, BC7Quality::HighQualityUniform);
         if (FAILED(hr)) return hr;
 
-        OutputDebugStringA(">>> RULE: ANIMATION ? BC7\n");
+        OutputDebugStringA(">>> RULE: ANIMATION = BC7 QuickOnly\n");
 
-        return SaveToDDSFile(
+        hr = SaveToDDSFile(
             bc7.GetImages(),
             bc7.GetImageCount(),
             bc7.GetMetadata(),
             DDS_FLAGS_NONE,
             dst);
+
+        if (FAILED(hr)) return hr;
+        return RULE_ANIMATION_BC7;
     }
 
     if (lower.find(L"jackpot") != std::wstring::npos)
     {
-
-        ScratchImage rgba;  hr = ConvertToRGBAFast(img, rgba);
-
+        ScratchImage rgba;
+        hr = ConvertToRGBAFast(img, rgba);
         if (FAILED(hr)) return hr;
 
         OutputDebugStringA(">>> RULE: JACKPOT FOLDER (UNCOMPRESSED)\n");
 
-        return SaveToDDSFile(
+        hr = SaveToDDSFile(
             rgba.GetImages(),
             rgba.GetImageCount(),
             rgba.GetMetadata(),
             DDS_FLAGS_NONE,
             dst);
-    }
-
-    if (srcPath.find(L"\\ProgressCounters\\") != std::wstring::npos)
-
-    {
-        ScratchImage rgba;  hr = ConvertToRGBAFast(img, rgba);
 
         if (FAILED(hr)) return hr;
+        return RULE_JACKPOT_UNCOMPRESSED;
+    }
 
-        return SaveToDDSFile(
+
+    if (srcPath.find(L"\\ProgressCounters\\") != std::wstring::npos)
+    {
+        ScratchImage rgba;
+        hr = ConvertToRGBAFast(img, rgba);
+        if (FAILED(hr)) return hr;
+
+        hr = SaveToDDSFile(
             rgba.GetImages(),
             rgba.GetImageCount(),
             rgba.GetMetadata(),
             DDS_FLAGS_NONE,
             dst);
+
+        if (FAILED(hr)) return hr;
+        return RULE_PROGRESSCOUNTERS_UNCOMP;
     }
 
 
 
     if (w > 750 && h > 750)
     {
-        ScratchImage rgba;  hr = ConvertToRGBA(img, rgba);
+        ScratchImage rgba;
+        hr = ConvertToRGBAFast(img, rgba);
         if (FAILED(hr)) return hr;
 
         ScratchImage bc7;
         hr = CompressBC7(rgba, bc7, BC7Quality::UltraFast);
         if (FAILED(hr)) return hr;
 
-        OutputDebugStringA(">>> RULE: 750>  ? BC7\n");
+        OutputDebugStringA(">>> RULE: BIG_750 = BC7 UltraFast\n");
 
-        return SaveToDDSFile(
+        hr = SaveToDDSFile(
             bc7.GetImages(),
             bc7.GetImageCount(),
             bc7.GetMetadata(),
             DDS_FLAGS_NONE,
             dst);
+
+        if (FAILED(hr)) return hr;
+        return RULE_BIG_750_BC7;
     }
+
 
     // -----------------------------------------------------------
 // REGLA 3: SÍMBOLOS PEQUEÑOS  BC3 (muy rápido)
@@ -1007,72 +1096,17 @@ int __stdcall ConvertPNGtoDDSW(const wchar_t* src, const wchar_t* dst)
 
         OutputDebugStringA(">>> RULE 3: Small solid symbol BC3\n");
 
-        return SaveToDDSFile(
+        hr = SaveToDDSFile(
             bc3.GetImages(),
             bc3.GetImageCount(),
             bc3.GetMetadata(),
             DDS_FLAGS_NONE,
             dst);
+
+        if (FAILED(hr)) return hr;
+        return RULE_SMALL_SOLID_SYMBOL_BC3;
     }
 
-
-    // -----------------------------------------------------------
-// REGLA 4: TIRA LARGA  BC7 QUICK o SIN COMPRESIÓN
-// -----------------------------------------------------------
-    if (IsLongStrip(w, h))
-    {
-        ScratchImage rgbaLocal;
-        hr = ConvertToRGBAFast(img, rgbaLocal);
-        if (FAILED(hr)) return hr;
-
-        ScratchImage bc7local;
-        hr = CompressBC7(rgbaLocal, bc7local, BC7Quality::QuickOnly);
-
-        OutputDebugStringA(">>> RULE 4: Long strip BC7 QuickOnly\n");
-
-        return SaveToDDSFile(
-            bc7local.GetImages(),
-            bc7local.GetImageCount(),
-            bc7local.GetMetadata(),
-            DDS_FLAGS_NONE,
-            dst);
-    }
-
-    if (IsLongStripSheet(base))
-    {
-        ScratchImage rgbaLocal;
-        hr = ConvertToRGBAFast(img, rgbaLocal);
-        if (FAILED(hr)) return hr;
-
-        if (DetectSoftAlpha(base) || colorStdDev > 25.0f)
-        {
-            OutputDebugStringA(">>> RULE 4B: Long strip sheet (gradient) UNCOMPRESSED\n");
-
-            return SaveToDDSFile(
-                rgbaLocal.GetImages(),
-                rgbaLocal.GetImageCount(),
-                rgbaLocal.GetMetadata(),
-                DDS_FLAGS_NONE,
-                dst);
-        }
-
-        ScratchImage bc3;
-        hr = CompressBC3(rgbaLocal, bc3);
-        if (FAILED(hr)) return hr;
-
-        OutputDebugStringA(">>> RULE 4C: Long strip sheet (solid) BC3\n");
-
-        return SaveToDDSFile(
-            bc3.GetImages(),
-            bc3.GetImageCount(),
-            bc3.GetMetadata(),
-            DDS_FLAGS_NONE,
-            dst);
-    }
-
-// -----------------------------------------------------------
-// REGLA 8: REDIMENSIONAR A MÚLTIPLO DE 4
-// -----------------------------------------------------------
     if ((w % 4) != 0 || (h % 4) != 0)
     {
         size_t newW = (w + 3) & ~3;
@@ -1092,37 +1126,119 @@ int __stdcall ConvertPNGtoDDSW(const wchar_t* src, const wchar_t* dst)
         h = newH;
     }
 
-
     if (lower.find(L"fonts") != std::wstring::npos)
     {
-        ScratchImage rgba;
-        hr = ConvertToRGBAFast(img, rgba);
+        ScratchImage rgbaFonts;
+        hr = ConvertToRGBAFast(img, rgbaFonts);
         if (FAILED(hr)) return hr;
+
 
         ScratchImage bc;
-        if (h <= 50)
-        {
-            hr = CompressBC7(rgba, bc, BC7Quality::FastBalanced);
-        }
-        else if (h <= 150)
-        {
-            hr = CompressBC7(rgba, bc, BC7Quality::Balanced);
-        }
-        else
-        {
-            hr = CompressBC7(rgba, bc, BC7Quality::Balanced);
+        hr = CompressBC7(rgbaFonts, bc, BC7Quality::HighQuality);
 
+        hr = SaveToDDSFile(
+            rgbaFonts.GetImages(),
+            rgbaFonts.GetImageCount(),
+            rgbaFonts.GetMetadata(),
+            DDS_FLAGS_NONE,
+            dst
+        );
+        if (FAILED(hr)) return hr;
+
+        return RULE_FONTS_BC7;   
+    }
+
+    if (IsLongStrip(w, h))
+    {
+        ScratchImage rgbaLocal;
+        hr = ConvertToRGBAFast(img, rgbaLocal);
+        if (FAILED(hr)) return hr;
+
+        ScratchImage bc7local;
+        hr = CompressBC7(rgbaLocal, bc7local, BC7Quality::QuickOnly);
+        if (FAILED(hr)) return hr;
+
+        OutputDebugStringA(">>> RULE 4: Long strip BC7 QuickOnly\n");
+
+        hr = SaveToDDSFile(
+            bc7local.GetImages(),
+            bc7local.GetImageCount(),
+            bc7local.GetMetadata(),
+            DDS_FLAGS_NONE,
+            dst);
+
+        if (FAILED(hr)) return hr;
+        return RULE_LONG_STRIP_BC7;
+    }
+
+
+    if (IsLongStripSheet(base))
+    {
+        ScratchImage rgbaLocal;
+        hr = ConvertToRGBAFast(img, rgbaLocal);
+        if (FAILED(hr)) return hr;
+
+        if (DetectSoftAlpha(base) || colorStdDev > 25.0f)
+        {
+            OutputDebugStringA(">>> RULE 4B: Long strip sheet (gradient) UNCOMPRESSED\n");
+
+            hr = SaveToDDSFile(
+                rgbaLocal.GetImages(),
+                rgbaLocal.GetImageCount(),
+                rgbaLocal.GetMetadata(),
+                DDS_FLAGS_NONE,
+                dst);
+
+            if (FAILED(hr)) return hr;
+            return RULE_LONG_STRIP_SHEET_UNCOMP;
         }
+
+        ScratchImage bc3;
+        hr = CompressBC3(rgbaLocal, bc3);
+        if (FAILED(hr)) return hr;
+
+        OutputDebugStringA(">>> RULE 4C: Long strip sheet (solid) BC3\n");
+
+        hr = SaveToDDSFile(
+            bc3.GetImages(),
+            bc3.GetImageCount(),
+            bc3.GetMetadata(),
+            DDS_FLAGS_NONE,
+            dst);
+
+        if (FAILED(hr)) return hr;
+        return RULE_LONG_STRIP_SHEET_BC3;
+    }
+
+    // [ANTES DEL FALLBACK INICIAL]
+
+// -------------------------------------------------------------
+// REGLA NUEVA: Imágenes gigantes = BC3 (antes del fallback)
+// -------------------------------------------------------------
+    if (w > 600 || h > 600)
+    {
+        ScratchImage rgbaLarge;
+        hr = ConvertToRGBAFast(img, rgbaLarge);
+        if (FAILED(hr)) return hr;
+
+        ScratchImage bc3Large;
+        hr = CompressBC3(rgbaLarge, bc3Large);
+        if (FAILED(hr)) return hr;
+
+        OutputDebugStringA(">>> RULE: BIG_IMAGE_OVERRIDE_BC3\n");
+
+        hr = SaveToDDSFile(
+            bc3Large.GetImages(),
+            bc3Large.GetImageCount(),
+            bc3Large.GetMetadata(),
+            DDS_FLAGS_NONE,
+            dst);
 
         if (FAILED(hr)) return hr;
 
-        return SaveToDDSFile(
-            bc.GetImages(),
-            bc.GetImageCount(),
-            bc.GetMetadata(),
-            DDS_FLAGS_NONE,
-            dst);
+        return RULE_BIG_IMAGE_BC3;
     }
+
 
 // -----------------------------------------------------------
 // REGLA 10: FALLBACK AUTOMÁTICO SI BC7 TARDA MUCHO
@@ -1131,34 +1247,42 @@ int __stdcall ConvertPNGtoDDSW(const wchar_t* src, const wchar_t* dst)
     hr = ConvertToRGBAFast(img, rgbaFinal);
     if (FAILED(hr)) return hr;
 
-    ScratchImage* srcToUse = &img;
     uint64_t t0 = GetTickCount64();
 
     ScratchImage bc7Final;
 
-    hr = CompressBC7(rgbaFinal, bc7Final, BC7Quality::Balanced);
+    // Arrancamos en Balanced
+    hr = CompressBC7(rgbaFinal, bc7Final, BC7Quality::HighQualityUniform);
+    if (FAILED(hr)) return hr;
 
     uint64_t elapsed = GetTickCount64() - t0;
+    int ruleId = RULE_DEFAULT_BC7_HIGH_QUALITY;
 
-    if (elapsed > 60000)
+    if (elapsed > 120000)
     {
         if (!DetectSoftAlpha(base) && colorStdDev < 22.0f)
         {
             hr = CompressBC3(rgbaFinal, bc7Final);
+            ruleId = RULE_FALLBACK_BC3;
         }
         else
         {
-            hr = CompressBC7(rgbaFinal, bc7Final, BC7Quality::FastBalanced);
+            hr = CompressBC7(rgbaFinal, bc7Final, BC7Quality::Balanced);
+            ruleId = RULE_FALLBACK_BC7_BALANCED;
         }
     }
 
     if (FAILED(hr)) return hr;
 
-    return SaveToDDSFile(
+    hr = SaveToDDSFile(
         bc7Final.GetImages(),
         bc7Final.GetImageCount(),
         bc7Final.GetMetadata(),
         DDS_FLAGS_NONE,
         dst);
+
+    if (FAILED(hr)) return hr;
+    return ruleId;
+
 
 }
