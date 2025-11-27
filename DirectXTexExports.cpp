@@ -6,6 +6,17 @@
 #include <cstdint>
 #include <vector>
 #include <string>
+#include <d3d11.h>
+#include <wrl/client.h>
+#include <mutex>
+
+#pragma comment(lib, "d3d11.lib")
+
+using Microsoft::WRL::ComPtr;
+
+// Device de DX11 para el compresor GPU BC7
+static ComPtr<ID3D11Device> g_bc7Device;
+static std::mutex g_bc7Mutex;
 
 using namespace DirectX;
 
@@ -55,71 +66,84 @@ HRESULT ConvertToRGBA(const ScratchImage& src, ScratchImage& out)
     return hr;
 }
 
-
-HRESULT CompressBC7(const ScratchImage& rgba, ScratchImage& out, BC7Quality quality = BC7Quality::FastBalanced)
+HRESULT CompressBC7(const ScratchImage& rgba, ScratchImage& out, BC7Quality quality)
 {
     TEX_COMPRESS_FLAGS flags = TEX_COMPRESS_DEFAULT;
 
     switch (quality)
     {
-        case BC7Quality::UltraFast:
-            // Más rápido de todos (calidad baja-media)
-            flags |= TEX_COMPRESS_BC7_QUICK |
-                TEX_COMPRESS_UNIFORM;
-            break;
+    case BC7Quality::UltraFast:
+        flags |= TEX_COMPRESS_BC7_QUICK | TEX_COMPRESS_UNIFORM;
+        break;
 
-        case BC7Quality::QuickOnly:
-            // Intermedio entre UltraFast y FastBalanced
-            // QUICK sin 3SUBSETS ni UNIFORM
-            flags |= TEX_COMPRESS_BC7_QUICK;
-            break;
+    case BC7Quality::QuickOnly:
+        flags |= TEX_COMPRESS_BC7_QUICK;
+        break;
 
-        case BC7Quality::FastBalanced:
-            // Rápido con buena calidad (recomendado)
-            flags |= TEX_COMPRESS_BC7_QUICK |
-                TEX_COMPRESS_BC7_USE_3SUBSETS;
-            break;
+    case BC7Quality::FastBalanced:
+        flags |= TEX_COMPRESS_BC7_QUICK | TEX_COMPRESS_BC7_USE_3SUBSETS;
+        break;
 
-        case BC7Quality::Balanced:
-            // Calidad alta, velocidad media
-            flags |= TEX_COMPRESS_BC7_USE_3SUBSETS;
-            break;
+    case BC7Quality::Balanced:
+        flags |= TEX_COMPRESS_BC7_USE_3SUBSETS;
+        break;
 
-        case BC7Quality::HighQuality:
+    case BC7Quality::HighQuality:
             flags |= TEX_COMPRESS_BC7_USE_3SUBSETS |
                 TEX_COMPRESS_BC7_QUICK |
                 TEX_COMPRESS_PARALLEL;
             break;
 
-        case BC7Quality::HighQualityUniform:
+    case BC7Quality::HighQualityUniform:
             // El más lento de todos (totalmente exhaustivo)
             flags |= TEX_COMPRESS_UNIFORM |
                 TEX_COMPRESS_BC7_USE_3SUBSETS;
-            break;
-        default:
-            break;
+        break;
+
+    default:
+        break;
     }
 
-    HRESULT hr = Compress(
+    HRESULT hr = E_FAIL;
+
+    // Si tenemos device, usamos el codec GPU de DirectXTex
+    if (g_bc7Device)
+    {
+        std::lock_guard<std::mutex> lock(g_bc7Mutex);
+
+        hr = DirectX::Compress(
+            g_bc7Device.Get(),
+            rgba.GetImages(),
+            rgba.GetImageCount(),
+            rgba.GetMetadata(),
+            DXGI_FORMAT_BC7_UNORM,     // o BC7_UNORM_SRGB según tu caso
+            flags,
+            1.0f,                       // alphaWeight (puedes ajustar)
+            out);
+
+        if (SUCCEEDED(hr))
+            return hr;
+        // si falla, hacemos fallback CPU abajo
+    }
+
+    // Fallback CPU (por si no hay device o falló GPU)
+    hr = DirectX::Compress(
         rgba.GetImages(),
         rgba.GetImageCount(),
         rgba.GetMetadata(),
         DXGI_FORMAT_BC7_UNORM,
         flags,
         1.0f,
-        out
-    );
+        out);
 
     return hr;
 }
 
-
-
 HRESULT CompressBC3(const ScratchImage& rgba, ScratchImage& out)
 {
     TEX_COMPRESS_FLAGS flags =
-        TEX_COMPRESS_PARALLEL |    // Usa varios cores
-        TEX_COMPRESS_DITHER;       // Suaviza el error (como Squish perceptual)
+        TEX_COMPRESS_DEFAULT |
+        TEX_COMPRESS_DITHER; // como Squish perceptual
 
     HRESULT hr = Compress(
         rgba.GetImages(),
@@ -132,6 +156,88 @@ HRESULT CompressBC3(const ScratchImage& rgba, ScratchImage& out)
     );
     return hr;
 }
+
+
+extern "C" __declspec(dllexport)
+HRESULT __stdcall InitBC7GpuDevice()
+{
+    if (g_bc7Device)
+        return S_OK; // ya inicializado
+
+    D3D_FEATURE_LEVEL featureLevels[] =
+    {
+        D3D_FEATURE_LEVEL_11_1,
+        D3D_FEATURE_LEVEL_11_0,
+        D3D_FEATURE_LEVEL_10_1,
+        D3D_FEATURE_LEVEL_10_0,
+    };
+
+    D3D_FEATURE_LEVEL obtained = D3D_FEATURE_LEVEL_10_0;
+    ComPtr<ID3D11Device> device;
+
+    HRESULT hr = D3D11CreateDevice(
+        nullptr,                    // adaptador por defecto
+        D3D_DRIVER_TYPE_HARDWARE,
+        nullptr,
+        D3D11_CREATE_DEVICE_SINGLETHREADED,
+        featureLevels,
+        _countof(featureLevels),
+        D3D11_SDK_VERSION,
+        device.GetAddressOf(),
+        &obtained,
+        nullptr);
+
+    if (FAILED(hr))
+        return hr;
+
+    g_bc7Device = device;
+
+    return S_OK;
+}
+
+
+// =========================================================
+// CALCULAR RMS entre dos imágenes RGBA8
+// =========================================================
+double ComputeRMS(const DirectX::Image* a, const DirectX::Image* b)
+{
+    size_t w = a->width;
+    size_t h = a->height;
+
+    const uint8_t* pa = a->pixels;
+    const uint8_t* pb = b->pixels;
+
+    double acc = 0.0;
+    size_t count = w * h * 3; // RGB
+
+    for (size_t y = 0; y < h; y++)
+    {
+        const uint8_t* ra = pa + y * a->rowPitch;
+        const uint8_t* rb = pb + y * b->rowPitch;
+
+        for (size_t x = 0; x < w; x++)
+        {
+            int dr = int(ra[x * 4 + 0]) - int(rb[x * 4 + 0]);
+            int dg = int(ra[x * 4 + 1]) - int(rb[x * 4 + 1]);
+            int db = int(ra[x * 4 + 2]) - int(rb[x * 4 + 2]);
+
+            acc += double(dr * dr + dg * dg + db * db);
+        }
+    }
+
+    return sqrt(acc / double(count));
+}
+
+// =========================================================
+// Calcular PSNR a partir del RMS
+// =========================================================
+double ComputePSNR(double rms)
+{
+    if (rms == 0.0)
+        return 100.0; // perfecto
+    return 20.0 * log10(255.0 / rms);
+}
+
 
 // Cálculo de desviación estándar del color
 float ComputeColorStdDev(const DirectX::Image* img)
@@ -275,11 +381,17 @@ HRESULT __stdcall CompressDXT(
     float alphaWeight,
     ScratchImage** outImage)
 {
-    if (!src) return E_INVALIDARG;
+    if (!src || !outImage)
+        return E_INVALIDARG;
+
     ScratchImage* out = new ScratchImage();
 
     TEX_COMPRESS_FLAGS flags = static_cast<TEX_COMPRESS_FLAGS>(compressFlags);
-    flags |= TEX_COMPRESS_BC7_QUICK | TEX_COMPRESS_PARALLEL;
+
+    // IMPORTANTE:
+    // Quitamos cualquier TEX_COMPRESS_PARALLEL interno,
+    // el multihilo lo controlas tú desde C# con tus workers.
+    flags = static_cast<TEX_COMPRESS_FLAGS>(flags & ~TEX_COMPRESS_PARALLEL);
 
     HRESULT hr = Compress(
         src->GetImages(),
@@ -300,7 +412,6 @@ HRESULT __stdcall CompressDXT(
     *outImage = out;
     return S_OK;
 }
-
 extern "C" __declspec(dllexport)
 HRESULT __stdcall ConvertToDDS(
     const wchar_t* inputPath,
@@ -317,12 +428,16 @@ HRESULT __stdcall ConvertToDDS(
     HRESULT hr = LoadFromWICFile(inputPath, (WIC_FLAGS)wicFlags, &meta, image);
     if (FAILED(hr)) return hr;
 
+    TEX_COMPRESS_FLAGS flags = static_cast<TEX_COMPRESS_FLAGS>(compressFlags);
+    // Igual que antes, NO dejamos que DirectXTex corra threads internos
+    flags = static_cast<TEX_COMPRESS_FLAGS>(flags & ~TEX_COMPRESS_PARALLEL);
+
     hr = Compress(
         image.GetImages(),
         image.GetImageCount(),
         image.GetMetadata(),
         outFormat,
-        (TEX_COMPRESS_FLAGS)compressFlags,
+        flags,
         alphaWeight,
         compressed);
 
@@ -335,6 +450,7 @@ HRESULT __stdcall ConvertToDDS(
         DDS_FLAGS_NONE,
         outputPath);
 }
+
 
 extern "C" __declspec(dllexport)
 HRESULT __stdcall SaveToDDSFileDXT(
@@ -888,6 +1004,40 @@ bool HasFineGradient(const ScratchImage& img)
 }
 
 
+extern "C" __declspec(dllexport)
+int __stdcall ConvertPNGtoDDSW_BC7_MaxQuality(const wchar_t* src, const wchar_t* dst)
+{
+    TexMetadata meta;
+    ScratchImage img;
+
+    HRESULT hr = LoadFromWICFile(src, WIC_FLAGS_IGNORE_SRGB, &meta, img);
+    if (FAILED(hr)) return hr;
+
+    const Image* base = img.GetImage(0, 0, 0);
+    size_t w = meta.width;
+    size_t h = meta.height;
+    ScratchImage rgba;
+    hr = ConvertToRGBAFast(img, rgba);
+    if (FAILED(hr)) return hr;
+
+    ScratchImage bc7;
+    hr = CompressBC7(rgba, bc7, BC7Quality::HighQualityUniform);
+    if (FAILED(hr)) return hr;
+
+    OutputDebugStringA(">>> RULE: BIG_750 = BC7 UltraFast\n");
+
+    hr = SaveToDDSFile(
+        bc7.GetImages(),
+        bc7.GetImageCount(),
+        bc7.GetMetadata(),
+        DDS_FLAGS_NONE,
+        dst);
+
+    if (FAILED(hr)) return hr;
+    return RULE_BIG_750_BC7;
+}
+
+
 
 extern "C" __declspec(dllexport)
 int __stdcall ConvertPNGtoDDSW(const wchar_t* src, const wchar_t* dst)
@@ -928,25 +1078,44 @@ int __stdcall ConvertPNGtoDDSW(const wchar_t* src, const wchar_t* dst)
 
     if (w < 450 && h < 450 && hasAlpha)
     {
+        //ScratchImage rgba;
+        //hr = ConvertToRGBAFast(img, rgba);
+        //if (FAILED(hr)) return hr;
+
+        //hr = SaveToDDSFile(
+        //    rgba.GetImages(),
+        //    rgba.GetImageCount(),
+        //    rgba.GetMetadata(),
+        //    DDS_FLAGS_NONE,
+        //    dst);
+
+        //if (FAILED(hr)) return hr;
+        //return RULE_SMALL_ALPHA_ICON;
         ScratchImage rgba;
         hr = ConvertToRGBAFast(img, rgba);
         if (FAILED(hr)) return hr;
 
+        ScratchImage bc7;
+        hr = CompressBC7(rgba, bc7, BC7Quality::HighQualityUniform);
+        if (FAILED(hr)) return hr;
+
+        OutputDebugStringA(">>> RULE: ANIMATION = BC7 QuickOnly\n");
+
         hr = SaveToDDSFile(
-            rgba.GetImages(),
-            rgba.GetImageCount(),
-            rgba.GetMetadata(),
+            bc7.GetImages(),
+            bc7.GetImageCount(),
+            bc7.GetMetadata(),
             DDS_FLAGS_NONE,
             dst);
 
         if (FAILED(hr)) return hr;
-        return RULE_SMALL_ALPHA_ICON;
+        return RULE_DEFAULT_BC7_HIGH_QUALITY;
     }
 
 
     if (IsGlowFX(base))
     {
-        ScratchImage rgba;
+        /*ScratchImage rgba;
         hr = ConvertToRGBAFast(img, rgba);
         if (FAILED(hr)) return hr;
 
@@ -958,13 +1127,33 @@ int __stdcall ConvertPNGtoDDSW(const wchar_t* src, const wchar_t* dst)
             dst);
 
         if (FAILED(hr)) return hr;
-        return RULE_GLOWFX_UNCOMPRESSED;
+        return RULE_GLOWFX_UNCOMPRESSED;*/
+
+        ScratchImage rgba;
+        hr = ConvertToRGBAFast(img, rgba);
+        if (FAILED(hr)) return hr;
+
+        ScratchImage bc7;
+        hr = CompressBC7(rgba, bc7, BC7Quality::HighQuality);
+        if (FAILED(hr)) return hr;
+
+        OutputDebugStringA(">>> RULE: ANIMATION = BC7 QuickOnly\n");
+
+        hr = SaveToDDSFile(
+            bc7.GetImages(),
+            bc7.GetImageCount(),
+            bc7.GetMetadata(),
+            DDS_FLAGS_NONE,
+            dst);
+
+        if (FAILED(hr)) return hr;
+        return RULE_DEFAULT_BC7_HIGH_QUALITY;
     }
 
 
     if (IsDarkGradientBackground(base))
     {
-        ScratchImage rgba;
+        /*ScratchImage rgba;
         hr = ConvertToRGBAFast(img, rgba);
         if (FAILED(hr)) return hr;
 
@@ -976,7 +1165,26 @@ int __stdcall ConvertPNGtoDDSW(const wchar_t* src, const wchar_t* dst)
             dst);
 
         if (FAILED(hr)) return hr;
-        return RULE_DARK_GRADIENT_UNCOMPRESSED;
+        return RULE_DARK_GRADIENT_UNCOMPRESSED;*/
+        ScratchImage rgba;
+        hr = ConvertToRGBAFast(img, rgba);
+        if (FAILED(hr)) return hr;
+
+        ScratchImage bc7;
+        hr = CompressBC7(rgba, bc7, BC7Quality::HighQuality);
+        if (FAILED(hr)) return hr;
+
+        OutputDebugStringA(">>> RULE: ANIMATION = BC7 QuickOnly\n");
+
+        hr = SaveToDDSFile(
+            bc7.GetImages(),
+            bc7.GetImageCount(),
+            bc7.GetMetadata(),
+            DDS_FLAGS_NONE,
+            dst);
+
+        if (FAILED(hr)) return hr;
+        return RULE_DEFAULT_BC7_HIGH_QUALITY;
     }
 
 
@@ -1013,7 +1221,7 @@ int __stdcall ConvertPNGtoDDSW(const wchar_t* src, const wchar_t* dst)
             dst);
 
         if (FAILED(hr)) return hr;
-        return RULE_ANIMATION_BC7;
+        return RULE_DEFAULT_BC7_HIGH_QUALITY;
     }
 
     if (lower.find(L"jackpot") != std::wstring::npos)
@@ -1145,7 +1353,7 @@ int __stdcall ConvertPNGtoDDSW(const wchar_t* src, const wchar_t* dst)
         );
         if (FAILED(hr)) return hr;
 
-        return RULE_FONTS_BC7;   
+        return RULE_DEFAULT_BC7_HIGH_QUALITY;
     }
 
     if (IsLongStrip(w, h))
@@ -1247,31 +1455,10 @@ int __stdcall ConvertPNGtoDDSW(const wchar_t* src, const wchar_t* dst)
     hr = ConvertToRGBAFast(img, rgbaFinal);
     if (FAILED(hr)) return hr;
 
-    uint64_t t0 = GetTickCount64();
-
     ScratchImage bc7Final;
 
-    // Arrancamos en Balanced
-    hr = CompressBC7(rgbaFinal, bc7Final, BC7Quality::HighQualityUniform);
-    if (FAILED(hr)) return hr;
-
-    uint64_t elapsed = GetTickCount64() - t0;
-    int ruleId = RULE_DEFAULT_BC7_HIGH_QUALITY;
-
-    if (elapsed > 120000)
-    {
-        if (!DetectSoftAlpha(base) && colorStdDev < 22.0f)
-        {
-            hr = CompressBC3(rgbaFinal, bc7Final);
-            ruleId = RULE_FALLBACK_BC3;
-        }
-        else
-        {
-            hr = CompressBC7(rgbaFinal, bc7Final, BC7Quality::Balanced);
-            ruleId = RULE_FALLBACK_BC7_BALANCED;
-        }
-    }
-
+    // Preset intermedio: buena calidad, mucho más razonable en tiempo
+    hr = CompressBC7(rgbaFinal, bc7Final, BC7Quality::FastBalanced);
     if (FAILED(hr)) return hr;
 
     hr = SaveToDDSFile(
@@ -1280,9 +1467,10 @@ int __stdcall ConvertPNGtoDDSW(const wchar_t* src, const wchar_t* dst)
         bc7Final.GetMetadata(),
         DDS_FLAGS_NONE,
         dst);
-
     if (FAILED(hr)) return hr;
-    return ruleId;
+
+    return RULE_DEFAULT_BC7_HIGH_QUALITY;
+
 
 
 }
